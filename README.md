@@ -15,10 +15,12 @@ We built something better.
 ## 💡 Our Solution
 
 A machine learning pipeline that:
-- Trains on **4 seasons of Premier League data** (2022–2026), **auto-downloaded** from football-data.co.uk — no manual CSV management
+- Trains on **5 seasons of Premier League data** (2022–2027, incl. the live 2026-27 season), **auto-downloaded** from football-data.co.uk — no manual CSV management
+- Adds **match-level xG for every season** from Understat, rolled into xG-for / xG-against form features
 - Uses **dual rolling form windows** (5-game short-term + 15-game long-term) to capture both momentum and underlying quality
 - Incorporates **shots on target**, **market-implied win probabilities**, and **Asian handicap lines** — all derived from historical data, no external API needed
-- Applies **season-aware weighting** so last season's form informs but doesn't distort current predictions
+- Applies **season-aware weighting** — a tunable discount on last season's games inside each team's form window
+- Builds prediction features through the **same pipeline as training**, so the app never feeds the model inputs it wasn't trained on
 - Uses a **chronological train/val/test split** — no data leakage, no inflated accuracy
 - Surfaces everything through a clean, interactive **Streamlit dashboard**
 
@@ -46,14 +48,15 @@ streamlit run app.py
 
 | Feature | Description |
 |---|---|
-| **Auto data refresh** | Fetches latest season data from football-data.co.uk on load, cached for 1 hour |
+| **Auto data refresh** | Fetches results/odds from football-data.co.uk and xG from Understat on load, cached for 1 hour |
 | **🔄 Refresh button** | Force re-download after a new matchweek |
-| **Team selector** | Pick any two PL teams from dropdowns |
+| **Team selector** | Pick any two current-season PL teams (relegated sides excluded) |
 | **Live prediction** | Win/Draw/Loss probabilities with colour-coded result banner |
 | **Form comparison table** | Short & long-term stats side by side for both teams |
 | **Feature importance chart** | See which signals the model weights most heavily |
 | **Configurable settings** | Tune form windows and season weights from the sidebar |
-| **Training log** | Transparent view of data loaded and model accuracy |
+| **Model metrics** | Test accuracy and log loss shown next to the bookmaker-favourite baseline on the same matches |
+| **Training log** | Transparent view of data loaded (incl. xG coverage) and model accuracy |
 
 ---
 
@@ -62,13 +65,11 @@ streamlit run app.py
 ```
 ML_PL_Project/
 │
-├── app.py                  # Streamlit frontend + UI logic
-├── xg_pl_predictor_v5.py   # Core model (standalone, runnable directly)
+├── app.py                  # Streamlit frontend + UI logic (imports the model)
+├── xg_pl_predictor.py      # Core model — PLPredictor (standalone, runnable directly)
 │
-├── PL_2223.csv             # Optional local fallback (auto-fetched if absent)
-├── PL_2324.csv
-├── PL_2425.csv
-├── PL_2526.csv
+├── PL 22-23.csv … PL 26-27.csv        # Local fallback for results/odds (auto-fetched if online)
+├── PL xG 22-23.csv … PL xG 26-27.csv  # Local fallback for Understat xG
 │
 └── README.md
 ```
@@ -80,22 +81,24 @@ ML_PL_Project/
 | Model | XGBoost (`multi:softprob`) |
 | Feature engineering | Pandas rolling windows, fully vectorised |
 | Frontend | Streamlit + Plotly |
-| Data | [football-data.co.uk](https://www.football-data.co.uk) (auto-fetched via `requests`) |
+| Data | [football-data.co.uk](https://www.football-data.co.uk) results & odds, [Understat](https://understat.com/league/EPL) xG (auto-fetched via `requests`) |
 
 ---
 
 ## 📊 How the Model Works
 
-### Features (41 total)
+### Features (51 total)
 
 Each match is represented by rolling stats computed **strictly from prior matches** — no lookahead bias.
 
 | Group | Features |
 |---|---|
-| Short form (last 5 games) | Strength, form pts, goals for/against, shots on target, market win prob, AH line — home & away |
+| Short form (last 5 games) | Strength, form pts, goals for/against, **xG for/against**, shots on target, market win prob, AH line — home & away |
 | Long form (last 15 games) | Same as above, capturing underlying quality over a larger window |
 | Difference features | Home minus away for each stat — gives the model relative signals |
 | Context | Home advantage flag |
+
+**xG features** (`xgf`, `xga`) are rolling averages of Understat expected goals — a less noisy read of chance quality than goals.
 
 **Market features** (`mkt`, `ah`) are rolling averages of implied win probabilities and Asian handicap lines from historical match odds in the dataset — no external odds input needed at prediction time.
 
@@ -105,14 +108,24 @@ Each match is represented by rolling stats computed **strictly from prior matche
 - **Split**: Chronological 70% train / 15% val / 15% test
 - **Recency weighting**: Exponential sample weights (~2.7x for newest vs oldest matches)
 - **Early stopping**: Prevents overfitting via validation loss monitoring
-- **Prior season discount**: Older seasons weighted at 0.4x to avoid stale signal
+- **Prior season weight**: How much last season's games count inside a team's form window (default 1.0 = no discount; 0.4 tested worse in walk-forward evaluation)
 
 ---
 
 ## 📈 Results
 
-| Metric | Value |
-|---|---|
+Walk-forward evaluation: retrain before each half-season from 2024-25 onward and predict it unseen (840 matches).
+
+| Model | Accuracy | Log loss |
+|---|---|---|
+| This model (v6, with xG) | 50.5% | 1.021 |
+| Previous model (v5, no xG) | 48.8% | 1.035 |
+| Bookmaker favourite (pre-match odds) | 51.4% | 0.995 |
+| Always predict home win | 41.4% | — |
+
+> Accuracy swings a lot with the test window: the bookmakers themselves hit 55–61% in 2022–24 but only 45–48% across 2025-26 H2 and the start of 2026-27 (home wins down to ~39%, draws ~30%). The in-app test set is the most recent 15% of matches, so it currently sits in that hard stretch — compare against the bookmaker number shown beside it, and prefer log loss over accuracy.
+
+---|---|
 | Test Accuracy | ~52–55% |
 | Baseline (always predict home win) | ~45% |
 | Classes | Home Win / Draw / Away Win |

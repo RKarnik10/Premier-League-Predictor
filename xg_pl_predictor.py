@@ -1,11 +1,15 @@
 """
-Premier League Match Predictor — v5
+Premier League Match Predictor — v6
 =====================================
-Features vs v4:
-  - Auto-downloads CSVs from football-data.co.uk (local files used as fallback)
-  - Shots on target (SOT) rolling features
-  - Rolling market-implied win probability + Asian handicap line from historical odds
-  - All features consistent between training and prediction (no external odds input needed)
+Features vs v5:
+  - Rolling xG for / against (Understat, all seasons) alongside goals, SOT and market signals
+  - Prediction builds features through the same pipeline as training (no train/predict drift)
+  - Prior-season weight now down-weights last season's games *within* a team's form window,
+    instead of rescaling whole seasons (which changed what a feature value meant season to season)
+  - Team list limited to the current season (relegated sides dropped)
+  - Test metrics include log loss and the bookmaker-favourite baseline on the same matches
+
+The Streamlit app (app.py) imports PLPredictor from here; run this file directly for a CLI demo.
 """
 
 import gc
@@ -15,13 +19,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import requests
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, log_loss
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
+
+_HERE = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +38,17 @@ _SEASON_CODES = {
     "2023-24": "2324",
     "2024-25": "2425",
     "2025-26": "2526",
+    "2026-27": "2627",
+}
+
+# Understat serves match-level xG for every season; keyed by the season's start year
+_US_BASE = "https://understat.com/getLeagueData/EPL/{year}"
+_US_TEAM_NAMES = {  # Understat name -> football-data.co.uk name
+    "Manchester City": "Man City",
+    "Manchester United": "Man United",
+    "Newcastle United": "Newcastle",
+    "Nottingham Forest": "Nott'm Forest",
+    "Wolverhampton Wanderers": "Wolves",
 }
 
 
@@ -48,49 +64,36 @@ def _download_season(season: str) -> pd.DataFrame | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Helper: compute stats for one form window
-# ---------------------------------------------------------------------------
-def _compute_stats(history: pd.DataFrame, team: str, default_goals: float = 1.5):
-    if len(history) == 0:
-        return dict(strength=50, form=5, goals_for=default_goals, goals_against=default_goals,
-                    sot=4.0, mkt_win=1/3, ah=0.0)
+def _download_xg(season: str) -> pd.DataFrame | None:
+    """Played matches for one season from Understat: home_team, away_team, home_xg, away_xg."""
+    year = season[:4]
+    try:
+        r = requests.get(
+            _US_BASE.format(year=year),
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://understat.com/league/EPL/{year}",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        games = [g for g in r.json()["dates"] if g.get("isResult")]
+    except Exception:
+        return None
+    if not games:
+        return None
+    return pd.DataFrame({
+        "home_team": [_US_TEAM_NAMES.get(g["h"]["title"], g["h"]["title"]) for g in games],
+        "away_team": [_US_TEAM_NAMES.get(g["a"]["title"], g["a"]["title"]) for g in games],
+        "home_xg": [float(g["xG"]["h"]) for g in games],
+        "away_xg": [float(g["xG"]["a"]) for g in games],
+    })
 
-    points = goals_scored = goals_conceded = shots = mkt_win_sum = ah_sum = 0.0
 
-    for _, m in history.iterrows():
-        if m["home_team"] == team:
-            goals_scored += m["home_goals"]
-            goals_conceded += m["away_goals"]
-            shots += float(m.get("hst") or 4) if not pd.isna(m.get("hst") or 0) else 4.0
-            mkt_win_sum += float(m.get("implied_h") or 1/3)
-            ah_sum += float(m.get("ah_line") or 0)
-            if m["result"] == "H":
-                points += 3
-            elif m["result"] == "D":
-                points += 1
-        else:
-            goals_scored += m["away_goals"]
-            goals_conceded += m["home_goals"]
-            shots += float(m.get("ast") or 4) if not pd.isna(m.get("ast") or 0) else 4.0
-            mkt_win_sum += float(m.get("implied_a") or 1/3)
-            ah_sum += -float(m.get("ah_line") or 0)
-            if m["result"] == "A":
-                points += 3
-            elif m["result"] == "D":
-                points += 1
-
-    n = len(history)
-    strength = min(90, max(10, (points / n) * 20 + 20))
-    return dict(
-        strength=strength,
-        form=points,
-        goals_for=goals_scored / n,
-        goals_against=goals_conceded / n,
-        sot=shots / n,
-        mkt_win=mkt_win_sum / n,
-        ah=ah_sum / n,
-    )
+# Per-team-per-match stats rolled into form features
+_STATS = ["pts", "gf", "ga", "sot", "mkt_win", "ah", "xgf", "xga"]
+_DEFAULTS = dict(form=5.0, gf=1.5, ga=1.5, strength=50.0, sot=4.0, mkt=1/3, ah=0.0, xgf=1.4, xga=1.4)
 
 
 class PLPredictor:
@@ -99,9 +102,12 @@ class PLPredictor:
         "2023-24": ["PL_2324.csv", "PL 23-24.csv"],
         "2024-25": ["PL_2425.csv", "PL 24-25.csv"],
         "2025-26": ["PL_2526.csv", "PL 25-26.csv"],
+        "2026-27": ["PL_2627.csv", "PL 26-27.csv"],
     }
+    # Understat snapshots, used only when the live xG download fails
+    XG_FILES = {season: f"PL xG {season[2:4]}-{season[5:]}.csv" for season in SEASON_FILES}
 
-    def __init__(self, short_window: int = 5, long_window: int = 15, prior_season_weight: float = 0.4):
+    def __init__(self, short_window: int = 5, long_window: int = 15, prior_season_weight: float = 1.0):
         self.short_window = short_window
         self.long_window = long_window
         self.prior_season_weight = prior_season_weight
@@ -122,47 +128,75 @@ class PLPredictor:
         )
         self.match_data: pd.DataFrame | None = None
         self._feature_columns: list[str] = []
+        self.metrics: dict = {}
+        self.class_report: str | None = None
+        self.feature_importance_df: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # 1. Data loading
     # ------------------------------------------------------------------
-    def get_football_data(self, include_historical: bool = False) -> bool:
-        seasons = ["2024-25", "2025-26"]
+    def get_football_data(
+        self,
+        include_historical: bool = False,
+        fetch_season=_download_season,
+        fetch_xg=_download_xg,
+    ) -> tuple[bool, list[str]]:
+        """fetch_season / fetch_xg can be swapped for cached versions (the Streamlit app does)."""
+        seasons = ["2024-25", "2025-26", "2026-27"]
         if include_historical:
             seasons = ["2022-23", "2023-24"] + seasons
 
-        all_matches = []
+        all_matches, log = [], []
         for season in seasons:
-            raw = _download_season(season)
+            raw = fetch_season(season)
             source = "football-data.co.uk"
             if raw is None:
-                candidates = self.SEASON_FILES.get(season, [])
-                path = next((p for p in candidates if Path(p).exists()), None)
-                if path is None:
-                    print(f"  [skip] {season} — not found online or locally")
-                    continue
-                try:
-                    raw = pd.read_csv(path)
-                    source = "local file"
-                except Exception as e:
-                    print(f"  [err]  {season} — {e}")
-                    continue
+                raw = self._read_local(self.SEASON_FILES.get(season, []))
+                source = "local file"
+            if raw is None:
+                log.append(f"⚠️ {season} — not found online or locally")
+                continue
             try:
                 cleaned = self._clean_season(raw, season)
-                all_matches.append(cleaned)
-                print(f"  [ok]   {season} — {len(cleaned)} matches ({source})")
             except Exception as e:
-                print(f"  [err]  {season} — {e}")
+                log.append(f"❌ {season} — {e}")
+                continue
+
+            xg = fetch_xg(season)
+            xg_source = "Understat"
+            if xg is None:
+                xg = self._read_local([self.XG_FILES[season]])
+                xg_source = "local Understat snapshot"
+            if xg is not None:
+                # Each fixture is played once per season, so (home, away) is a unique key
+                xg = xg.drop_duplicates(["home_team", "away_team"], keep="last")
+                cleaned = cleaned.merge(xg, on=["home_team", "away_team"], how="left")
+            else:
+                cleaned["home_xg"] = cleaned["away_xg"] = np.nan
+                xg_source = "unavailable"
+            n_xg = cleaned["home_xg"].notna().sum()
+
+            all_matches.append(cleaned)
+            log.append(f"✅ {season} — {len(cleaned)} matches ({source}), xG for {n_xg} ({xg_source})")
 
         if not all_matches:
-            print("No data loaded.")
-            return False
+            return False, log
 
         self.match_data = pd.concat(all_matches, ignore_index=True)
-        self.match_data.sort_values("date", inplace=True)
+        self.match_data.sort_values("date", inplace=True, kind="stable")
         self.match_data.reset_index(drop=True, inplace=True)
-        print(f"Total matches loaded: {len(self.match_data)}")
-        return True
+        log.append(f"📊 Total: {len(self.match_data)} matches")
+        return True, log
+
+    @staticmethod
+    def _read_local(candidates: list[str]) -> pd.DataFrame | None:
+        path = next((_HERE / p for p in candidates if (_HERE / p).exists()), None)
+        if path is None:
+            return None
+        try:
+            return pd.read_csv(path, encoding="utf-8-sig")
+        except Exception:
+            return None
 
     def _clean_season(self, data: pd.DataFrame, season: str) -> pd.DataFrame:
         rows = []
@@ -213,109 +247,82 @@ class PLPredictor:
                 ah_line=ah,
             ))
 
-        return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        return pd.DataFrame(rows).sort_values("date", kind="stable").reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # 2. Feature engineering
     # ------------------------------------------------------------------
-    def _build_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy().sort_values("date").reset_index(drop=True)
+    def _rolling_team_stats(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
+        """One row per (match, team) with that team's form over its previous `window` games.
 
+        Games from an earlier season than the match being described count prior_season_weight
+        as much as same-season games. Because games are date-sorted, the same-season games are
+        always the most recent part of the window, so they can be rolled separately and the
+        earlier-season part recovered as (whole window − same-season part).
+        """
+        home = df[["match_id", "date", "season", "home_team", "h_pts", "home_goals", "away_goals",
+                   "hst", "implied_h", "ah_line", "home_xg", "away_xg"]].copy()
+        away = df[["match_id", "date", "season", "away_team", "a_pts", "away_goals", "home_goals",
+                   "ast", "implied_a", "ah_line", "away_xg", "home_xg"]].copy()
+        home.columns = away.columns = ["match_id", "date", "season", "team"] + _STATS
+        away["ah"] = -away["ah"]  # AH line from the away team's perspective
+        long = pd.concat([home, away]).sort_values(["team", "date", "match_id"], kind="stable").reset_index(drop=True)
+
+        def roll(keys):
+            g = long.groupby(keys)[_STATS]
+            sums = g.transform(lambda x: x.shift(1).rolling(window, min_periods=1).sum()).fillna(0)
+            counts = g.transform(lambda x: x.shift(1).rolling(window, min_periods=1).count()).fillna(0)
+            return sums, counts
+
+        all_sum, all_cnt = roll("team")
+        same_sum, same_cnt = roll(["team", "season"])
+        w = self.prior_season_weight
+        num = same_sum + w * (all_sum - same_sum)
+        den = same_cnt + w * (all_cnt - same_cnt)
+        avg = num / den.where(den > 0)
+
+        out = long[["match_id", "team"]].copy()
+        out["form"] = num["pts"].where(den["pts"] > 0)
+        out["strength"] = (avg["pts"] * 20 + 20).clip(10, 90)
+        for col in ["gf", "ga", "sot", "ah", "xgf", "xga"]:
+            out[col] = avg[col]
+        out["mkt"] = avg["mkt_win"]
+        return out
+
+    def _build_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        df = data.copy().sort_values("date", kind="stable").reset_index(drop=True)
+        df["match_id"] = np.arange(len(df))
         df["h_pts"] = df["result"].map({"H": 3, "D": 1, "A": 0})
         df["a_pts"] = df["result"].map({"A": 3, "D": 1, "H": 0})
-        df["h_gf"], df["h_ga"] = df["home_goals"], df["away_goals"]
-        df["a_gf"], df["a_ga"] = df["away_goals"], df["home_goals"]
 
-        def _rolling_team_stats(df: pd.DataFrame, window: int) -> pd.DataFrame:
-            home_rows = df[["date", "season", "home_team", "h_pts", "h_gf", "h_ga", "hst", "implied_h", "ah_line"]].copy()
-            home_rows.columns = ["date", "season", "team", "pts", "gf", "ga", "sot", "mkt_win", "ah"]
-            away_rows = df[["date", "season", "away_team", "a_pts", "a_gf", "a_ga", "ast", "implied_a", "ah_line"]].copy()
-            away_rows.columns = ["date", "season", "team", "pts", "gf", "ga", "sot", "mkt_win", "ah"]
-            away_rows["ah"] = -away_rows["ah"]
-
-            combined = pd.concat([home_rows, away_rows]).sort_values(["team", "date"]).reset_index(drop=True)
-
-            current_season = combined["season"].max()
-            weight = combined["season"].apply(lambda s: 1.0 if s == current_season else self.prior_season_weight)
-            combined["pts"] *= weight
-            combined["gf"] *= weight
-            combined["ga"] *= weight
-
-            grp = combined.groupby("team")[["pts", "gf", "ga", "sot", "mkt_win", "ah"]]
-            rolled = grp.apply(lambda x: x.shift(1).rolling(window, min_periods=1).sum()).reset_index(level=0, drop=True)
-            count = grp.apply(lambda x: x["pts"].shift(1).rolling(window, min_periods=1).count()).reset_index(level=0, drop=True).rename("n")
-
-            combined = combined.join(rolled, rsuffix="_roll").join(count)
-            combined["n"] = combined["n"].clip(lower=1)
-            combined["gf_avg"] = combined["gf_roll"] / combined["n"]
-            combined["ga_avg"] = combined["ga_roll"] / combined["n"]
-            combined["sot_avg"] = combined["sot_roll"] / combined["n"]
-            combined["mkt_win_avg"] = combined["mkt_win_roll"] / combined["n"]
-            combined["ah_avg"] = combined["ah_roll"] / combined["n"]
-            combined["strength"] = (combined["pts_roll"] / combined["n"]) * 20 + 20
-            combined["strength"] = combined["strength"].clip(10, 90)
-            return combined[["date", "season", "team", "pts_roll", "gf_avg", "ga_avg", "strength", "sot_avg", "mkt_win_avg", "ah_avg"]]
-
-        short = _rolling_team_stats(df, self.short_window)
-        long = _rolling_team_stats(df, self.long_window)
-
-        for side, team_col in [("h", "home_team"), ("a", "away_team")]:
-            for prefix, stats_df in [("short", short), ("long", long)]:
-                merged = df[["date", team_col]].merge(
-                    stats_df, left_on=["date", team_col], right_on=["date", "team"], how="left"
+        for prefix, window in [("short", self.short_window), ("long", self.long_window)]:
+            stats = self._rolling_team_stats(df, window)
+            for side, team_col in [("h", "home_team"), ("a", "away_team")]:
+                merged = df[["match_id", team_col]].merge(
+                    stats, left_on=["match_id", team_col], right_on=["match_id", "team"], how="left"
                 )
-                df[f"{side}_{prefix}_form"] = merged["pts_roll"].values
-                df[f"{side}_{prefix}_gf"] = merged["gf_avg"].values
-                df[f"{side}_{prefix}_ga"] = merged["ga_avg"].values
-                df[f"{side}_{prefix}_strength"] = merged["strength"].values
-                df[f"{side}_{prefix}_sot"] = merged["sot_avg"].values
-                df[f"{side}_{prefix}_mkt"] = merged["mkt_win_avg"].values
-                df[f"{side}_{prefix}_ah"] = merged["ah_avg"].values
-
-        for prefix in ("h_short", "h_long", "a_short", "a_long"):
-            df[f"{prefix}_form"].fillna(5, inplace=True)
-            df[f"{prefix}_gf"].fillna(1.5, inplace=True)
-            df[f"{prefix}_ga"].fillna(1.5, inplace=True)
-            df[f"{prefix}_strength"].fillna(50, inplace=True)
-            df[f"{prefix}_sot"].fillna(4.0, inplace=True)
-            df[f"{prefix}_mkt"].fillna(1/3, inplace=True)
-            df[f"{prefix}_ah"].fillna(0.0, inplace=True)
-
-        df["home_advantage"] = 1
-        df.drop(columns=["h_pts", "a_pts", "h_gf", "h_ga", "a_gf", "a_ga"], inplace=True)
-        del short, long
+                for stat, default in _DEFAULTS.items():
+                    df[f"{side}_{prefix}_{stat}"] = merged[stat].fillna(default).values
+            del stats
         gc.collect()
 
-        df["strength_diff_short"] = df["h_short_strength"] - df["a_short_strength"]
-        df["strength_diff_long"] = df["h_long_strength"] - df["a_long_strength"]
-        df["form_diff_short"] = df["h_short_form"] - df["a_short_form"]
-        df["form_diff_long"] = df["h_long_form"] - df["a_long_form"]
-        df["gf_diff_short"] = df["h_short_gf"] - df["a_short_gf"]
-        df["gf_diff_long"] = df["h_long_gf"] - df["a_long_gf"]
-        df["sot_diff_short"] = df["h_short_sot"] - df["a_short_sot"]
-        df["sot_diff_long"] = df["h_long_sot"] - df["a_long_sot"]
-        df["mkt_diff_short"] = df["h_short_mkt"] - df["a_short_mkt"]
-        df["mkt_diff_long"] = df["h_long_mkt"] - df["a_long_mkt"]
+        df["home_advantage"] = 1
+        df.drop(columns=["h_pts", "a_pts"], inplace=True)
 
-        print(f"Features built for {len(df)} matches.")
+        for window in ("short", "long"):
+            for stat in ("strength", "form", "gf", "sot", "mkt", "xgf", "xga"):
+                df[f"{stat}_diff_{window}"] = df[f"h_{window}_{stat}"] - df[f"a_{window}_{stat}"]
         return df
 
     # ------------------------------------------------------------------
     # 3. Training
     # ------------------------------------------------------------------
     def _feature_cols(self) -> list[str]:
-        return [
-            "h_short_strength", "h_short_form", "h_short_gf", "h_short_ga", "h_short_sot", "h_short_mkt", "h_short_ah",
-            "a_short_strength", "a_short_form", "a_short_gf", "a_short_ga", "a_short_sot", "a_short_mkt", "a_short_ah",
-            "h_long_strength", "h_long_form", "h_long_gf", "h_long_ga", "h_long_sot", "h_long_mkt", "h_long_ah",
-            "a_long_strength", "a_long_form", "a_long_gf", "a_long_ga", "a_long_sot", "a_long_mkt", "a_long_ah",
-            "strength_diff_short", "strength_diff_long",
-            "form_diff_short", "form_diff_long",
-            "gf_diff_short", "gf_diff_long",
-            "sot_diff_short", "sot_diff_long",
-            "mkt_diff_short", "mkt_diff_long",
-            "home_advantage",
-        ]
+        per_team = [f"{side}_{window}_{stat}" for window in ("short", "long") for side in ("h", "a")
+                    for stat in ("strength", "form", "gf", "ga", "sot", "mkt", "ah", "xgf", "xga")]
+        diffs = [f"{stat}_diff_{window}" for stat in ("strength", "form", "gf", "sot", "mkt", "xgf", "xga")
+                 for window in ("short", "long")]
+        return per_team + diffs + ["home_advantage"]
 
     @staticmethod
     def _time_split(X, y, train_frac=0.70, val_frac=0.15):
@@ -323,10 +330,10 @@ class PLPredictor:
         t, v = int(n * train_frac), int(n * (train_frac + val_frac))
         return X.iloc[:t], y[:t], X.iloc[t:v], y[t:v], X.iloc[v:], y[v:]
 
-    def train_model(self) -> bool:
+    def train_model(self) -> tuple[bool, list[str]]:
         if self.match_data is None:
-            print("No data loaded.")
-            return False
+            return False, ["No data loaded."]
+        log = []
 
         featured = self._build_features(self.match_data)
         featured = featured.iloc[self.long_window:].reset_index(drop=True)
@@ -334,51 +341,114 @@ class PLPredictor:
         self._feature_columns = self._feature_cols()
         X = featured[self._feature_columns].copy()
         y = self.label_encoder.fit_transform(featured["result"])
-
-        del featured
-        gc.collect()
-
-        print(f"Classes: {list(self.label_encoder.classes_)}")
-        print(f"Dataset size: {len(X)}")
+        log.append(f"Classes: {list(self.label_encoder.classes_)}")
+        log.append(f"Dataset size: {len(X)} matches, {len(self._feature_columns)} features")
 
         X_train, y_train, X_val, y_val, X_test, y_test = self._time_split(X, y)
-        print(f"Split → train: {len(X_train)}, val: {len(X_val)}, test: {len(X_test)}")
+        log.append(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
         sample_weights = np.exp(np.linspace(0, 1, len(X_train)))
         self.model.fit(X_train, y_train, sample_weight=sample_weights, eval_set=[(X_val, y_val)], verbose=False)
 
-        preds = self.model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-        print(f"\nTest accuracy: {acc:.1%}  ({len(X_test)} matches)")
-        print("\nClassification report:")
-        print(classification_report(y_test, preds, target_names=self.label_encoder.classes_, zero_division=0))
+        proba = self.model.predict_proba(X_test)
+        preds = proba.argmax(axis=1)
 
-        if hasattr(self.model, "best_iteration") and self.model.best_iteration:
-            print(f"Best XGBoost iteration: {self.model.best_iteration}")
+        # Bookmaker baseline on the same matches: pre-match implied probabilities, in label order
+        test_rows = featured.iloc[len(X_train) + len(X_val):]
+        implied = {"H": "implied_h", "D": "implied_d", "A": "implied_a"}
+        market = test_rows[[implied[c] for c in self.label_encoder.classes_]].to_numpy()
+        home_idx = list(self.label_encoder.classes_).index("H")
+        labels = np.arange(len(self.label_encoder.classes_))
 
-        fi = pd.DataFrame({
+        self.metrics = dict(
+            test_matches=len(y_test),
+            test_from=test_rows["date"].min(),
+            test_to=test_rows["date"].max(),
+            accuracy=accuracy_score(y_test, preds),
+            log_loss=log_loss(y_test, proba, labels=labels),
+            market_accuracy=accuracy_score(y_test, market.argmax(axis=1)),
+            market_log_loss=log_loss(y_test, market, labels=labels),
+            home_win_rate=float(np.mean(y_test == home_idx)),
+        )
+        self.class_report = classification_report(
+            y_test, preds, target_names=self.label_encoder.classes_, zero_division=0
+        )
+        self.feature_importance_df = pd.DataFrame({
             "Feature": self._feature_columns,
             "Importance": self.model.feature_importances_,
         }).sort_values("Importance", ascending=False)
 
-        fig = px.bar(
-            fi, x="Importance", y="Feature", orientation="h",
-            title="Feature Importance (XGBoost v5)",
-            text=fi["Importance"].round(3),
+        m = self.metrics
+        log.append(
+            f"✅ Test ({m['test_from']:%d %b %Y} – {m['test_to']:%d %b %Y}): "
+            f"accuracy {m['accuracy']:.1%}, log loss {m['log_loss']:.3f}"
         )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(yaxis=dict(autorange="reversed"), template="plotly_white")
-        fig.show()
+        log.append(
+            f"   Bookmaker favourite on same matches: accuracy {m['market_accuracy']:.1%}, "
+            f"log loss {m['market_log_loss']:.3f} · home wins {m['home_win_rate']:.1%}"
+        )
+        del featured
+        gc.collect()
+        return True, log
 
-        return True
+    def walk_forward(self, start_season: str = "2024-25") -> pd.DataFrame:
+        """Retrain before each half-season from start_season on and score it unseen.
+
+        Steadier than the single train_model() split, which only covers the most recent ~240
+        matches. Each block is scored against the bookmaker favourite on the same matches.
+        """
+        featured = self._build_features(self.match_data)
+        featured = featured.iloc[self.long_window:].reset_index(drop=True)
+        featured["block"] = featured["season"] + np.where(featured["date"].dt.month >= 7, " H1", " H2")
+        cols = self._feature_cols()
+        encoder = LabelEncoder()
+        y = encoder.fit_transform(featured["result"])
+        implied = {"H": "implied_h", "D": "implied_d", "A": "implied_a"}
+        market_cols = [implied[c] for c in encoder.classes_]
+        home_idx = list(encoder.classes_).index("H")
+        labels = np.arange(len(encoder.classes_))
+
+        def score(name, y_true, proba, market):
+            return dict(
+                block=name,
+                matches=len(y_true),
+                accuracy=accuracy_score(y_true, proba.argmax(axis=1)),
+                log_loss=log_loss(y_true, proba, labels=labels),
+                market_accuracy=accuracy_score(y_true, market.argmax(axis=1)),
+                market_log_loss=log_loss(y_true, market, labels=labels),
+                home_win_rate=float(np.mean(y_true == home_idx)),
+            )
+
+        rows, all_y, all_p, all_m = [], [], [], []
+        for block in sorted(b for b in featured["block"].unique() if b >= start_season):
+            test = featured.index[featured["block"] == block]
+            train = featured.index[featured["date"] < featured.loc[test, "date"].min()]
+            cut = int(len(train) * 0.85)  # last 15% of history for early stopping
+            fit, val = train[:cut], train[cut:]
+
+            model = XGBClassifier(**self.model.get_params())
+            model.fit(
+                featured.loc[fit, cols], y[fit], sample_weight=np.exp(np.linspace(0, 1, len(fit))),
+                eval_set=[(featured.loc[val, cols], y[val])], verbose=False,
+            )
+            proba = model.predict_proba(featured.loc[test, cols])
+            market = featured.loc[test, market_cols].to_numpy()
+            rows.append(score(block, y[test], proba, market))
+            all_y.append(y[test]); all_p.append(proba); all_m.append(market)
+
+        if rows:
+            rows.append(score("Overall", np.concatenate(all_y), np.vstack(all_p), np.vstack(all_m)))
+        return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
     # 4. Prediction
     # ------------------------------------------------------------------
     def known_teams(self) -> list[str]:
+        """Teams in the latest loaded season (relegated sides from earlier seasons excluded)."""
         if self.match_data is None:
             return []
-        return sorted(set(self.match_data["home_team"]) | set(self.match_data["away_team"]))
+        current = self.match_data[self.match_data["season"] == self.match_data["season"].max()]
+        return sorted(set(current["home_team"]) | set(current["away_team"]))
 
     def _validate_team(self, name: str) -> str:
         teams = self.known_teams()
@@ -389,94 +459,90 @@ class PLPredictor:
         if suggestions:
             msg += f" Did you mean one of: {suggestions}?"
         else:
-            msg += f" Known teams: {teams}"
+            msg += f" Current-season teams: {teams}"
         raise ValueError(msg)
 
-    def predict_match(self, home_team: str, away_team: str):
+    def predict_match(self, home_team: str, away_team: str) -> dict:
         home_team = self._validate_team(home_team)
         away_team = self._validate_team(away_team)
 
-        print(f"\nPREDICTING: {home_team} (H)  vs  {away_team} (A)")
-        print("=" * 55)
+        # Append the fixture as an unplayed match so its features come from the training pipeline
+        fixture = pd.DataFrame([dict(
+            season=self.match_data["season"].max(),
+            date=self.match_data["date"].max() + pd.Timedelta(days=1),
+            home_team=home_team,
+            away_team=away_team,
+        )])
+        featured = self._build_features(pd.concat([self.match_data, fixture], ignore_index=True))
+        row = featured.iloc[-1]
+        feat = featured[self._feature_columns].iloc[[-1]]
 
-        prior = self.match_data
-        ht_p = prior[(prior["home_team"] == home_team) | (prior["away_team"] == home_team)]
-        at_p = prior[(prior["home_team"] == away_team) | (prior["away_team"] == away_team)]
+        proba = self.model.predict_proba(feat)[0]
+        classes = self.label_encoder.inverse_transform(np.arange(len(proba)))
+        pred_lbl = classes[proba.argmax()]
 
-        hs  = _compute_stats(ht_p.tail(self.short_window), home_team)
-        hl  = _compute_stats(ht_p.tail(self.long_window),  home_team)
-        as_ = _compute_stats(at_p.tail(self.short_window), away_team)
-        al  = _compute_stats(at_p.tail(self.long_window),  away_team)
+        def team_stats(side):
+            return {
+                window: dict(
+                    strength=row[f"{side}_{window}_strength"],
+                    form=row[f"{side}_{window}_form"],
+                    goals_for=row[f"{side}_{window}_gf"],
+                    goals_against=row[f"{side}_{window}_ga"],
+                    xg_for=row[f"{side}_{window}_xgf"],
+                    xg_against=row[f"{side}_{window}_xga"],
+                )
+                for window in ("short", "long")
+            }
 
-        feat = pd.DataFrame([{
-            "h_short_strength": hs["strength"], "h_short_form": hs["form"],
-            "h_short_gf": hs["goals_for"],      "h_short_ga": hs["goals_against"],
-            "h_short_sot": hs["sot"],           "h_short_mkt": hs["mkt_win"],   "h_short_ah": hs["ah"],
-            "a_short_strength": as_["strength"], "a_short_form": as_["form"],
-            "a_short_gf": as_["goals_for"],      "a_short_ga": as_["goals_against"],
-            "a_short_sot": as_["sot"],           "a_short_mkt": as_["mkt_win"],  "a_short_ah": as_["ah"],
-            "h_long_strength": hl["strength"],   "h_long_form": hl["form"],
-            "h_long_gf": hl["goals_for"],        "h_long_ga": hl["goals_against"],
-            "h_long_sot": hl["sot"],             "h_long_mkt": hl["mkt_win"],    "h_long_ah": hl["ah"],
-            "a_long_strength": al["strength"],   "a_long_form": al["form"],
-            "a_long_gf": al["goals_for"],        "a_long_ga": al["goals_against"],
-            "a_long_sot": al["sot"],             "a_long_mkt": al["mkt_win"],    "a_long_ah": al["ah"],
-            "strength_diff_short": hs["strength"] - as_["strength"],
-            "strength_diff_long":  hl["strength"] - al["strength"],
-            "form_diff_short":     hs["form"]     - as_["form"],
-            "form_diff_long":      hl["form"]     - al["form"],
-            "gf_diff_short":       hs["goals_for"] - as_["goals_for"],
-            "gf_diff_long":        hl["goals_for"] - al["goals_for"],
-            "sot_diff_short":      hs["sot"] - as_["sot"],
-            "sot_diff_long":       hl["sot"] - al["sot"],
-            "mkt_diff_short":      hs["mkt_win"] - as_["mkt_win"],
-            "mkt_diff_long":       hl["mkt_win"] - al["mkt_win"],
-            "home_advantage": 1,
-        }])
-
-        print("\nFeatures fed to model:")
-        print(feat.T.rename(columns={0: "value"}).to_string())
-
-        pred_int = self.model.predict(feat)[0]
-        proba    = self.model.predict_proba(feat)[0]
-        pred_lbl = self.label_encoder.inverse_transform([pred_int])[0]
-        classes  = self.label_encoder.inverse_transform(np.arange(len(proba)))
-
-        labels = {"H": f"{home_team} Win", "D": "Draw", "A": f"{away_team} Win"}
-        print(f"\nPREDICTION: {labels[pred_lbl]}")
-        print("Probabilities:")
-        for lbl, p in sorted(zip(classes, proba), key=lambda x: -x[1]):
-            print(f"  {labels[lbl]:<25} {p:.1%}")
-
-        prob_df = pd.DataFrame({
-            "Outcome": [labels[l] for l in classes],
-            "Probability": proba,
-        })
-        fig = px.pie(
-            prob_df, names="Outcome", values="Probability",
-            title=f"{home_team} vs {away_team}",
-        )
-        fig.show()
-
-        return pred_lbl, dict(zip(classes, proba))
+        return {
+            "pred_lbl": pred_lbl,
+            "probas": dict(zip(classes, proba)),
+            "features": feat.iloc[0],
+            "home_stats": team_stats("h"),
+            "away_stats": team_stats("a"),
+        }
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    print("Premier League Predictor — v5")
+    import plotly.express as px
+
+    print("Premier League Predictor — v6")
     print("=" * 55)
 
-    predictor = PLPredictor(short_window=5, long_window=15, prior_season_weight=0.4)
+    predictor = PLPredictor(short_window=5, long_window=15, prior_season_weight=1.0)
 
-    if not predictor.get_football_data(include_historical=True):
+    ok, log = predictor.get_football_data(include_historical=True)
+    print("\n".join(log))
+    if not ok:
         return
 
-    if not predictor.train_model():
+    ok, log = predictor.train_model()
+    print("\n".join(log))
+    if not ok:
         return
+    print("\nClassification report:")
+    print(predictor.class_report)
+    if predictor.model.best_iteration:
+        print(f"Best XGBoost iteration: {predictor.model.best_iteration}")
 
-    print("\nKnown teams:", predictor.known_teams())
+    print("\nWalk-forward evaluation (retrained before each half-season, scored unseen):")
+    wf = predictor.walk_forward()
+    print(wf.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+    fi = predictor.feature_importance_df
+    fig = px.bar(
+        fi, x="Importance", y="Feature", orientation="h",
+        title="Feature Importance (XGBoost v6)",
+        text=fi["Importance"].round(3),
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(yaxis=dict(autorange="reversed"), template="plotly_white")
+    fig.show()
+
+    print("\nCurrent-season teams:", predictor.known_teams())
 
     matches_to_predict = [
         ("Tottenham", "Arsenal"),
@@ -486,9 +552,28 @@ def main():
 
     for home, away in matches_to_predict:
         try:
-            predictor.predict_match(home, away)
+            result = predictor.predict_match(home, away)
         except ValueError as e:
             print(f"[skip] {e}")
+            continue
+
+        print(f"\nPREDICTING: {home} (H)  vs  {away} (A)")
+        print("=" * 55)
+        print("\nFeatures fed to model:")
+        print(result["features"].to_frame("value").to_string())
+
+        labels = {"H": f"{home} Win", "D": "Draw", "A": f"{away} Win"}
+        print(f"\nPREDICTION: {labels[result['pred_lbl']]}")
+        print("Probabilities:")
+        for lbl, p in sorted(result["probas"].items(), key=lambda x: -x[1]):
+            print(f"  {labels[lbl]:<25} {p:.1%}")
+
+        prob_df = pd.DataFrame({
+            "Outcome": [labels[l] for l in result["probas"]],
+            "Probability": list(result["probas"].values()),
+        })
+        fig = px.pie(prob_df, names="Outcome", values="Probability", title=f"{home} vs {away}")
+        fig.show()
 
 
 if __name__ == "__main__":
