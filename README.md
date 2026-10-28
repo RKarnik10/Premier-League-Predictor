@@ -31,7 +31,7 @@ A machine learning pipeline that:
 ```bash
 # 1. Clone the repo
 git clone https://github.com/RKarnik10/-ML_PL_Project.git
-cd ML_PL_Project
+cd ./-ML_PL_Project
 
 # 2. Install dependencies
 pip install streamlit xgboost scikit-learn plotly pandas requests
@@ -56,6 +56,7 @@ streamlit run app.py
 | **Feature importance chart** | See which signals the model weights most heavily |
 | **Configurable settings** | Tune form windows and season weights from the sidebar |
 | **Model metrics** | Test accuracy and log loss shown next to the bookmaker-favourite baseline on the same matches |
+| **Walk-forward table** | Per-half-season accuracy and log loss vs the bookmaker, retrained before each block |
 | **Training log** | Transparent view of data loaded (incl. xG coverage) and model accuracy |
 
 ---
@@ -123,14 +124,19 @@ Walk-forward evaluation: retrain before each half-season from 2024-25 onward and
 | Bookmaker favourite (pre-match odds) | 51.4% | 0.995 |
 | Always predict home win | 41.4% | — |
 
-> Accuracy swings a lot with the test window: the bookmakers themselves hit 55–61% in 2022–24 but only 45–48% across 2025-26 H2 and the start of 2026-27 (home wins down to ~39%, draws ~30%). The in-app test set is the most recent 15% of matches, so it currently sits in that hard stretch — compare against the bookmaker number shown beside it, and prefer log loss over accuracy.
+| Block | Matches | Model acc. | Model log loss | Bookmaker acc. | Bookmaker log loss | Home win rate |
+|---|---|---|---|---|---|---|
+| 2024-25 H1 | 188 | 47.9% | 1.028 | 50.0% | 0.990 | 40.4% |
+| 2024-25 H2 | 192 | 55.7% | 1.002 | 58.3% | 0.952 | 41.1% |
+| 2025-26 H1 | 186 | 53.8% | 0.973 | 54.3% | 0.971 | 46.8% |
+| 2025-26 H2 | 194 | 47.4% | 1.073 | 44.8% | 1.058 | 38.7% |
+| 2026-27 H1 | 80 | 43.8% | 1.037 | 47.5% | 1.020 | 38.8% |
 
----|---|
-| Test Accuracy | ~52–55% |
-| Baseline (always predict home win) | ~45% |
-| Classes | Home Win / Draw / Away Win |
+> Accuracy swings a lot with the test window: the bookmakers themselves hit 55–61% in 2022–24 but only 45–48% across 2025-26 H2 and the start of 2026-27 (home wins down to ~39%, draws ~30%). The in-app test set is the most recent 15% of matches (currently 238 matches, 24 Jan – 25 Oct 2026: model 45.4% / 1.036 vs bookmaker 47.1% / 1.027), so it sits in that hard stretch — compare against the bookmaker number shown beside it, and prefer log loss over accuracy.
 
-> Football is inherently unpredictable — a model beating the always-home-win baseline consistently is genuinely useful. Bookmaker models typically sit around 55–60% with far more features.
+> Football is inherently unpredictable. The model beats the always-home-win baseline comfortably and gets close to the bookmakers on log loss, but doesn't beat them yet.
+
+Reproduce with `python xg_pl_predictor.py` (prints the in-app test split and the walk-forward table).
 
 ---
 
@@ -155,7 +161,10 @@ Walk-forward evaluation: retrain before each half-season from 2024-25 onward and
 
 ## 📂 Data Source
 
-All match data from [football-data.co.uk](https://www.football-data.co.uk/englandm.php) — free, reliable, updated after every matchweek.
+- **Results, shots and odds:** [football-data.co.uk](https://www.football-data.co.uk/englandm.php) — free, reliable, updated after every matchweek.
+- **Expected goals (xG):** [Understat](https://understat.com/league/EPL) — match-level xG for every season, matched to each fixture.
+
+Snapshots of both are saved in the repo as an offline fallback.
 
 ---
 
